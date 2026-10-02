@@ -60,9 +60,9 @@ public sealed class TextLayout
         face.Italic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
 
     /// <summary>The font for layout and drawing alike. A face without a bold or italic variant gets them synthesized, as Photoshop's faux styles do.</summary>
-    private SKFont MakeFont(TextFace face)
+    private SKFont MakeFont(TextFace face, SKTypeface? overrideTypeface = null)
     {
-        var typeface = TypefaceFor(face);
+        var typeface = overrideTypeface ?? TypefaceFor(face);
         var font = new SKFont(typeface, (float)Math.Clamp(Style.Size, 1, 4000)) { Subpixel = true, Edging = SKFontEdging.Antialias, Hinting = SKFontHinting.None };
         if (face.Bold && typeface.FontWeight < (int)SKFontStyleWeight.SemiBold) font.Embolden = true;
         if (face.Italic && typeface.FontSlant == SKFontStyleSlant.Upright) font.SkewX = -0.25f;
@@ -73,8 +73,27 @@ public sealed class TextLayout
     private sealed class Fonts(TextLayout layout) : IDisposable
     {
         private readonly Dictionary<TextFace, SKFont> fonts = [];
+        private readonly Dictionary<(TextFace Face, int Codepoint), SKFont> fallbackFonts = [];
         public SKFont For(TextFace face) => fonts.TryGetValue(face, out var font) ? font : fonts[face] = layout.MakeFont(face);
-        public void Dispose() { foreach (var font in fonts.Values) font.Dispose(); }
+
+        // Prefer the requested typeface whenever it contains the glyph; only substitute missing characters.
+        // The same resolved font is used for measuring and rendering, so the caret stays in sync.
+        public SKFont For(TextFace face, Rune rune)
+        {
+            var primary = For(face);
+            if (primary.GetGlyphs(rune.ToString()) is [var glyph] && glyph != 0) return primary;
+            var key = (face, rune.Value);
+            if (fallbackFonts.TryGetValue(key, out var cached)) return cached;
+            var substitute = SKFontManager.Default.MatchCharacter(face.FontFamily, FontStyle(face), ["ko"], rune.Value);
+            if (substitute == null) return primary;
+            return fallbackFonts[key] = layout.MakeFont(face, substitute);
+        }
+
+        public void Dispose()
+        {
+            foreach (var font in fonts.Values) font.Dispose();
+            foreach (var font in fallbackFonts.Values) font.Dispose();
+        }
     }
 
     public TextLayout(TextStyle style)
@@ -155,12 +174,29 @@ public sealed class TextLayout
             while (end < text.Length && Style.FaceAt(end) == face) end++;
             var font = fonts.For(face);
             var segment = text.Substring(start, end - start);
-            var widths = font.GetGlyphWidths(font.GetGlyphs(segment));
-            var glyph = 0;
-            for (var i = 0; i < segment.Length && glyph < widths.Length; i++)
+            var glyphs = font.GetGlyphs(segment);
+            if (Array.TrueForAll(glyphs, glyph => glyph != 0))
             {
-                advances[start + i] = widths[glyph++] + tracking;
-                if (char.IsHighSurrogate(segment[i]) && i + 1 < segment.Length && char.IsLowSurrogate(segment[i + 1])) i++;
+                // Keep the original fast path, including the selected face's glyph advances.
+                var widths = font.GetGlyphWidths(glyphs);
+                var glyph = 0;
+                for (var i = 0; i < segment.Length && glyph < widths.Length; i++)
+                {
+                    advances[start + i] = widths[glyph++] + tracking;
+                    if (char.IsHighSurrogate(segment[i]) && i + 1 < segment.Length && char.IsLowSurrogate(segment[i + 1])) i++;
+                }
+            }
+            else
+            {
+                for (var i = 0; i < segment.Length;)
+                {
+                    var rune = Rune.GetRuneAt(segment, i);
+                    var selected = fonts.For(face, rune);
+                    var character = rune.ToString();
+                    var width = selected.GetGlyphWidths(selected.GetGlyphs(character));
+                    advances[start + i] = (width.Length > 0 ? width[0] : 0) + tracking;
+                    i += rune.Utf16SequenceLength;
+                }
             }
             start = end;
         }
@@ -232,27 +268,55 @@ public sealed class TextLayout
                 var font = fonts.For(face);
                 var segment = Text.Substring(line.Start + k, end - k);
                 var glyphs = font.GetGlyphs(segment);
-                if (glyphs.Length > 0)
+                paint.Color = new SKColor(color);
+                if (Array.TrueForAll(glyphs, glyph => glyph != 0))
                 {
-                    var positions = new SKPoint[glyphs.Length];
-                    var glyph = 0;
-                    for (var i = 0; i < segment.Length && glyph < glyphs.Length; i++)
+                    DrawGlyphs(font, glyphs, line, k, segment, canvas, paint);
+                }
+                else
+                {
+                    // Skia returns glyph 0 for missing characters. Resolve each Unicode scalar
+                    // through the OS fallback manager instead of drawing the missing-glyph box.
+                    for (var i = 0; i < segment.Length;)
                     {
-                        positions[glyph++] = new SKPoint(line.X + line.Positions[k + i], line.Baseline);
-                        if (char.IsHighSurrogate(segment[i]) && i + 1 < segment.Length && char.IsLowSurrogate(segment[i + 1])) i++;
+                        var rune = Rune.GetRuneAt(segment, i);
+                        var selected = fonts.For(face, rune);
+                        var character = rune.ToString();
+                        var resolved = selected.GetGlyphs(character);
+                        if (resolved.Length > 0 && resolved[0] != 0)
+                        {
+                            using var builder = new SKTextBlobBuilder();
+                            var run = builder.AllocatePositionedRun(selected, resolved.Length);
+                            run.SetGlyphs(resolved);
+                            run.SetPositions(Enumerable.Repeat(new SKPoint(line.X + line.Positions[k + i], line.Baseline), resolved.Length).ToArray());
+                            using var blob = builder.Build();
+                            if (blob != null) canvas.DrawText(blob, 0, 0, paint);
+                        }
+                        i += rune.Utf16SequenceLength;
                     }
-                    using var builder = new SKTextBlobBuilder();
-                    var run = builder.AllocatePositionedRun(font, glyphs.Length);
-                    run.SetGlyphs(glyphs);
-                    run.SetPositions(positions);
-                    using var blob = builder.Build();
-                    paint.Color = new SKColor(color);
-                    if (blob != null) canvas.DrawText(blob, 0, 0, paint);
                 }
                 k = end;
             }
         }
         canvas.Restore();
+    }
+
+    private static void DrawGlyphs(SKFont font, ushort[] glyphs, Line line, int offset, string segment, SKCanvas canvas, SKPaint paint)
+    {
+        if (glyphs.Length == 0) return;
+        var positions = new SKPoint[glyphs.Length];
+        var glyph = 0;
+        for (var i = 0; i < segment.Length && glyph < glyphs.Length; i++)
+        {
+            positions[glyph++] = new SKPoint(line.X + line.Positions[offset + i], line.Baseline);
+            if (char.IsHighSurrogate(segment[i]) && i + 1 < segment.Length && char.IsLowSurrogate(segment[i + 1])) i++;
+        }
+        using var builder = new SKTextBlobBuilder();
+        var run = builder.AllocatePositionedRun(font, glyphs.Length);
+        run.SetGlyphs(glyphs);
+        run.SetPositions(positions);
+        using var blob = builder.Build();
+        if (blob != null) canvas.DrawText(blob, 0, 0, paint);
     }
 
     // ---- Caret geometry -------------------------------------------------------------------------------------------
