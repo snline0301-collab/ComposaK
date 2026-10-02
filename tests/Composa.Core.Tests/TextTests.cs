@@ -13,6 +13,26 @@ public class TextLayoutTests
     private static readonly string Family = EditorSession.FontFamilies.FirstOrDefault(f => f.Contains("Sans", StringComparison.OrdinalIgnoreCase)) ?? EditorSession.FontFamilies.First();
 
     [Fact]
+    public void Missing_hangul_glyphs_use_a_system_fallback_when_available()
+    {
+        const string hangul = "새농 한글";
+        // Some CI environments install no Korean fonts, so verify the fallback only
+        // if the system font manager can actually provide the requested characters.
+        var primary = TextLayout.TypefaceFor(new TextStyle { FontFamily = Family });
+        var sample = new SKFont(primary, 48);
+        if (sample.GetGlyphs(hangul).All(glyph => glyph != 0)) return;
+        var fallback = SKFontManager.Default.MatchCharacter(Family,
+            new SKFontStyle(SKFontStyleWeight.Normal, SKFontStyleWidth.Normal, SKFontStyleSlant.Upright),
+            new[] { "ko" }, '새');
+        if (fallback is null) return;
+
+        var layout = new TextLayout(new TextStyle { FontFamily = Family, Size = 48, Text = hangul });
+        Assert.True(layout.Lines[0].VisibleWidth > 0);
+        using var image = layout.Render();
+        Assert.Contains(image.Pixels, pixel => pixel.Alpha > 0);
+    }
+
+    [Fact]
     public void Point_text_is_as_big_as_its_longest_line()
     {
         var layout = new TextLayout(new TextStyle { Text = "Hello\nComposa for Linux", Size = 40, FontFamily = Family });
